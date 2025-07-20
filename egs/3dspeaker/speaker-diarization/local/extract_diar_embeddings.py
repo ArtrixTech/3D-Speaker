@@ -35,6 +35,7 @@ parser.add_argument('--embs_out', default='', type=str, help='Out embedding dir'
 parser.add_argument('--batchsize', default=64, type=int, help='Batchsize for extracting embeddings')
 parser.add_argument('--use_gpu', action='store_true', help='Use gpu or not')
 parser.add_argument('--gpu', nargs='+', help='GPU id to use.')
+parser.add_argument('--rec_id_to_process', default=None, type=str, help='If specified, process only this recording ID.')
 
 
 FEATURE_COMMON = {
@@ -96,26 +97,26 @@ supports = {
 def main():
     args = parser.parse_args()
     conf = yaml_config_loader(args.conf)
-    rank = int(os.environ['LOCAL_RANK'])
-    threads_num = int(os.environ['WORLD_SIZE'])
-    dist.init_process_group(backend='gloo')
+    # The script is now run in single-process mode from our parallel runner,
+    # so we can remove the dependency on distributed environment variables.
+    rank = 0
+    threads_num = 1
+    
+    print("[INFO]: Running in single-process mode for embedding extraction.")
+
     if args.model_id is not None:
         # use the model id pretrained model
         assert isinstance(args.model_id, str) and \
         is_official_hub_path(args.model_id), "Invalid modelscope model id."
         assert args.model_id in supports, "Model id not currently supported."
         model_config = supports[args.model_id]
-        # download models from modelscope given model_id
-        if rank == 0:
-            cache_dir = snapshot_download(
-                        args.model_id,
-                        revision=model_config['revision'],
-                        )
-            obj_list = [cache_dir]
-        else:
-            obj_list = [None]
-        dist.broadcast_object_list(obj_list, 0)
-        cache_dir = obj_list[0]
+        
+        # Always use simple download in single-process mode.
+        cache_dir = snapshot_download(
+            args.model_id,
+            revision=model_config['revision'],
+        )
+        
         pretrained_model = os.path.join(cache_dir, model_config['model_pt'])
         conf['embedding_model'] = model_config['model']
         conf['pretrained_model'] = pretrained_model
@@ -134,32 +135,39 @@ def main():
     with open(args.subseg_json, "r") as f:
         subseg_json = json.load(f)
 
-    all_keys = subseg_json.keys()
-    A = [i.rsplit('_', 2)[0] for i in all_keys]
-    all_rec_ids = list(set(A))
-    all_rec_ids.sort()
-    if len(all_rec_ids) == 0:
-        print("[WARNING]:No recording IDs found! Please check if json file is accuratly generated.")
-    if len(all_rec_ids) <= rank:
-        print("[WARNING]: The number of threads exceeds the number of files.")
-        sys.exit()
-
-    metadata={}
-    for rec_id in all_rec_ids:
-        subset = {}
-        for key in subseg_json:
-            k = str(key)
-            if k.rsplit('_',2)[0]==rec_id:
-                subset[key] = subseg_json[key]
-        metadata[rec_id]=subset
+    # When --rec_id_to_process is used, it now refers to a specific segment ID.
+    if args.rec_id_to_process:
+        target_seg_id = args.rec_id_to_process
+        if target_seg_id not in subseg_json:
+            print(f"[ERROR]: Segment ID {target_seg_id} not found in {args.subseg_json}")
+            sys.exit(1)
+        # Create a metadata dictionary containing only the target segment
+        rec_id = target_seg_id.rsplit('_', 2)[0]
+        metadata = {rec_id: {target_seg_id: subseg_json[target_seg_id]}}
+        local_rec_ids = [rec_id]
+    else:
+        # Fallback for processing all segments if no specific segment ID is given
+        all_keys = list(subseg_json.keys())
+        all_rec_ids = sorted(list(set(i.rsplit('_', 2)[0] for i in all_keys)))
+        if not all_rec_ids:
+            print("[WARNING]:No recording IDs found! Please check if json file is accuratly generated.")
+            sys.exit(0)
+        
+        metadata = {}
+        for rec_id in all_rec_ids:
+            subset = {key: subseg_json[key] for key in all_keys if key.startswith(f"{rec_id}_")}
+            metadata[rec_id] = subset
+        local_rec_ids = all_rec_ids
 
     print("[INFO]: Start computing embeddings...")
-    local_rec_ids = all_rec_ids[rank::threads_num]
 
     if args.use_gpu:
-        gpu_id = int(args.gpu[rank%len(args.gpu)])
+        # In our parallel setup, each process can be assigned a GPU.
+        # The 'gpu' arg is a list, but we expect one ID per process.
+        # Default to GPU 0 if not specified.
+        gpu_id = int(args.gpu[0]) if args.gpu else 0
         if gpu_id < torch.cuda.device_count():
-            device = torch.device('cuda:%d'%gpu_id)
+            device = torch.device('cuda:%d' % gpu_id)
         else:
             print("[WARNING]: Gpu %s is not available. Use cpu instead." % gpu_id)
             device = torch.device('cpu')
@@ -178,37 +186,32 @@ def main():
     # compute embeddings of sub-segments
     for rec_id in local_rec_ids:
         meta = metadata[rec_id]
-        emb_file_name = rec_id + ".pkl"
-        stat_emb_file = os.path.join(args.embs_out, emb_file_name)
-        if not os.path.isfile(stat_emb_file):
-            embeddings = []
-            wav_path = meta[list(meta.keys())[0]]['file']
-            obj_fs = feature_extractor.sample_rate
-            wav = load_audio(wav_path, obj_fs=obj_fs)
- 
-            wavs = [wav[0, int(meta[i]['start']*obj_fs):int(meta[i]['stop']*obj_fs)] for i in meta]
-            max_len = max([x.shape[0] for x in wavs])
-            wavs = [circle_pad(x, max_len) for x in wavs]
-            wavs = torch.stack(wavs).unsqueeze(1)
+        
+        # Process each segment individually
+        wav_path = meta[list(meta.keys())[0]]['file']
+        obj_fs = feature_extractor.sample_rate
+        wav = load_audio(wav_path, obj_fs=obj_fs)
 
-            embeddings = []
-            batch_st = 0
-            with torch.no_grad():
-                while batch_st < wavs.shape[0]:
-                    wavs_batch = wavs[batch_st: batch_st+args.batchsize].to(device)
-                    feats_batch = torch.vmap(feature_extractor)(wavs_batch)
-                    embeddings_batch = embedding_model(feats_batch).cpu()
-                    embeddings.append(embeddings_batch)
-                    batch_st += args.batchsize
-            embeddings = torch.cat(embeddings, dim=0).numpy()
+        for seg_id, seg_meta in meta.items():
+            emb_file_name = f"{seg_id}.pkl"
+            stat_emb_file = os.path.join(args.embs_out, emb_file_name)
 
-            stat_obj = {
-                'embeddings': embeddings, 
-                'times': [[meta[i]['start'], meta[i]['stop']] for i in meta]
+            if not os.path.isfile(stat_emb_file):
+                start_time = int(seg_meta['start'] * obj_fs)
+                end_time = int(seg_meta['stop'] * obj_fs)
+                wav_seg = wav[0, start_time:end_time].unsqueeze(0)
+
+                with torch.no_grad():
+                    feat = feature_extractor(wav_seg).unsqueeze(0).to(device)
+                    embedding = embedding_model(feat).cpu().numpy()
+
+                stat_obj = {
+                    'embeddings': embedding, 
+                    'times': [[seg_meta['start'], seg_meta['stop']]]
                 }
-            pickle.dump(stat_obj, open(stat_emb_file,'wb'))
-        else:
-            print("[WARNING]: Embeddings has been saved previously. Skip it.")
+                pickle.dump(stat_obj, open(stat_emb_file, 'wb'))
+            else:
+                print(f"[INFO]: Embedding for {seg_id} has been saved previously. Skip it.")
 
 if __name__ == "__main__":
     main()
